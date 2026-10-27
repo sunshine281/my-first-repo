@@ -180,3 +180,4 @@ with st.sidebar:
             st.write("暂无文档")
     else:
         st.write("文档目录不存在")
+        print('666')
