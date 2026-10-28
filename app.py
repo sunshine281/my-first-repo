@@ -3,25 +3,47 @@
 # 核心流程：用户提问 → 向量检索相关文档 → Prompt 增强 → LLM 生成答案
 # ============================================================
 
-# ---------- 轻量 import（尽量让首屏快速出来） ----------
-import os, sys
-from pathlib import Path
-from dotenv import load_dotenv
-import streamlit as st
+# ---------- 标准库 ----------
+import os, sys                              # os: 环境变量/路径判断；sys: 系统参数（本项目主要用 os）
+from pathlib import Path                   # 面向对象的路径操作，比 os.path 更简洁，代码里用它来拼接绝对路径
+from dotenv import load_dotenv             # 读取 .env 文件，让 os.getenv() 能拿到 API Key 等配置
 
-load_dotenv()
-os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+load_dotenv()  # 把 .env 里的键值对注入当前进程的环境变量
 
 # ---------- 全局配置 ----------
+# __file__ 是当前脚本的相对路径，resolve() 转绝对路径，parent 取所在目录
+# 这样无论从哪个目录执行 streamlit run，都能正确定位 docs/ 和 chroma_db/
 _BASE_DIR = Path(__file__).resolve().parent
 
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")   # 从 .env 读取 DeepSeek API 密钥
 
-_env_docs = os.getenv("DOCS_DIR", "docs")
-_env_chroma = os.getenv("CHROMA_DB_DIR", "chroma_db")
+_env_docs = os.getenv("DOCS_DIR", "docs")           # 文档目录，默认 "docs"（可被 .env 覆盖）
+_env_chroma = os.getenv("CHROMA_DB_DIR", "chroma_db")  # 向量库持久化目录，默认 "chroma_db"
 
+# 如果 .env 里写的是相对路径（不以 / 或盘符开头），就拼到 _BASE_DIR 后面变成绝对路径
 DOCS_DIR = _env_docs if Path(_env_docs).is_absolute() else str(_BASE_DIR / _env_docs)
 CHROMA_DB_DIR = _env_chroma if Path(_env_chroma).is_absolute() else str(_BASE_DIR / _env_chroma)
+
+# ---------- HuggingFace 国内镜像 ----------
+# huggingface.co 在国内被墙，hf-mirror.com 是官方推荐的国内镜像
+# 这行必须在 import torch / langchain_huggingface 之前设置，否则库初始化时已经默认走了 huggingface.co
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+
+# ---------- 第三方库 ----------
+import streamlit as st                     # Web 应用框架：声明式 UI（标题、输入框、按钮、侧边栏等）
+import torch                               # 深度学习框架：这里只用来检测 CUDA/GPU 是否可用，决定 Embedding 跑在哪
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+                                           # LangChain 的文本切片器：把长文档按字符数+自然边界切成多个 chunk
+from langchain_huggingface import HuggingFaceEmbeddings
+                                           # 把文本转成向量的 Embedding 模型适配器：这里用中文模型 text2vec-base-chinese
+from langchain_chroma import Chroma        # ChromaDB 向量数据库：存储 Embedding 向量，支持相似度检索
+from langchain_community.document_loaders import DirectoryLoader, PyPDFLoader, TextLoader
+                                           # DirectoryLoader: 批量扫描目录下的文件
+                                           # PyPDFLoader: 从 PDF 中提取文字（每页一个 Document 对象）
+                                           # TextLoader: 从 TXT 文件中提取文字
+from langchain_openai import ChatOpenAI    # LLM 客户端：兼容 OpenAI API 协议，这里用它调用 DeepSeek 的 deepseek-flash 模型
+from langchain_core.messages import HumanMessage, SystemMessage
+                                           # LangChain 的消息数据结构：构造 LLM 的对话 Prompt（系统提示 + 用户问题）
 
 # ---------- 启动校验 ----------
 if not DEEPSEEK_API_KEY:
@@ -29,16 +51,14 @@ if not DEEPSEEK_API_KEY:
     st.error("❌ 请在 .env 文件中设置 DEEPSEEK_API_KEY")
     st.stop()
 
-# ---------- Streamlit 页面设置（尽可能靠前，让浏览器立刻渲染首屏） ----------
+# ---------- Streamlit 页面设置 ----------
 st.set_page_config(page_title="预测性维护问答助手", layout="wide")
 st.title("🔧 预测性维护知识问答助手")
 st.markdown("基于您的内部文档，回答设备维护相关问题，并自动标注引用来源。")
 
-# ---------- Embedding 模型缓存 ----------
+# ---------- Embedding 模型 ----------
 @st.cache_resource
 def get_embedding_model():
-    import torch
-    from langchain_huggingface import HuggingFaceEmbeddings
     device = "cuda" if torch.cuda.is_available() else "cpu"
     st.info(f"嵌入计算设备: {device.upper()}")
     return HuggingFaceEmbeddings(
@@ -50,7 +70,6 @@ def get_embedding_model():
 # ---------- 向量库初始化 ----------
 @st.cache_resource
 def init_vectorstore():
-    from langchain_chroma import Chroma
 
     if os.path.exists(CHROMA_DB_DIR):
         st.info("从磁盘加载已有向量库")
@@ -59,9 +78,6 @@ def init_vectorstore():
             persist_directory=CHROMA_DB_DIR,
             embedding_function=embedding_model,
         )
-
-    from langchain_text_splitters import RecursiveCharacterTextSplitter
-    from langchain_community.document_loaders import DirectoryLoader, PyPDFLoader, TextLoader
 
     docs_path = Path(DOCS_DIR)
     if not docs_path.exists():
@@ -106,10 +122,9 @@ if vectorstore is None:
 # ---------- 检索器 ----------
 retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
 
-# ---------- LLM（懒初始化） ----------
+# ---------- LLM ----------
 @st.cache_resource
 def get_llm():
-    from langchain_openai import ChatOpenAI
     return ChatOpenAI(
         model="deepseek-flash",
         temperature=0.1,
@@ -119,8 +134,6 @@ def get_llm():
 
 # ---------- RAG 主函数 ----------
 def ask_question(question: str) -> str:
-    from langchain_core.messages import HumanMessage, SystemMessage
-
     docs = retriever.invoke(question)
     context_parts = []
     references = []
@@ -133,7 +146,7 @@ def ask_question(question: str) -> str:
         references.append(f"[{i+1}] 《{Path(source).name}》第{page}页")
     context = "\n\n".join(context_parts)
 
-    system_prompt = """你是一位专业的预测性维护工程师。请严格依据以下提供的文档内容回答问题。
+    system_prompt = """你是一位机械故障诊断专家。请严格依据以下提供的文档内容回答问题。
 如果文档中没有足够的信息，请诚实地说"文档中未找到相关信息"。不要在答案中添加虚构的内容。"""
     user_prompt = f"""以下是相关文档片段：
 {context}
